@@ -1043,6 +1043,206 @@ export default function WishlistPage() {
 }
 ```
 
+# app\actions\admin\orders.ts
+
+```ts
+//app/actions/admin/orders.ts
+
+'use server';
+
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+import { prisma } from '@/lib/prisma';
+import { OrderStatus } from '@prisma/client';
+import { revalidatePath } from 'next/cache';
+
+// Check if user is admin
+async function checkAdmin() {
+  const session = await getServerSession(authOptions);
+  
+  if (session?.user?.role !== 'ADMIN') {
+    throw new Error('Unauthorized');
+  }
+  
+  return session;
+}
+
+// Get order details
+export async function getOrderDetails(orderId: string) {
+  try {
+    await checkAdmin();
+
+    const order = await prisma.order.findUnique({
+      where: {
+        id: orderId,
+      },
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        orderItems: {
+          include: {
+            product: true,
+          },
+        },
+      },
+    });
+
+    if (!order) {
+      throw new Error('Order not found');
+    }
+
+    // Mock tracking info - in a real app, you'd get this from a shipping provider
+    const trackingInfo = {
+      number: 'TRK' + order.id,
+      carrier: 'Royal Mail',
+      status: 'In Transit',
+      estimatedDelivery: new Date(Date.now() + 2 * 24 * 60 * 60 * 1000).toISOString(),
+      events: [
+        {
+          date: new Date().toISOString(),
+          location: 'London Sorting Center',
+          status: 'Package in transit'
+        },
+        {
+          date: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+          location: 'London',
+          status: 'Package picked up'
+        }
+      ]
+    };
+
+    return {
+      ...order,
+      tracking: trackingInfo
+    };
+  } catch (error) {
+    console.error('Error fetching order:', error);
+    throw error;
+  }
+}
+
+// Get all orders
+export async function getAllOrders() {
+  try {
+    await checkAdmin();
+
+    const orders = await prisma.order.findMany({
+      include: {
+        user: {
+          select: {
+            id: true,
+            name: true,
+            email: true,
+          },
+        },
+        orderItems: {
+          include: {
+            product: {
+              select: {
+                id: true,
+                name: true,
+              },
+            },
+          },
+        },
+      },
+      orderBy: {
+        createdAt: 'desc',
+      },
+    });
+
+    return orders;
+  } catch (error) {
+    console.error('Error fetching orders:', error);
+    throw error;
+  }
+}
+
+// Update order status
+export async function updateOrderStatus(orderId: string, status: string) {
+  try {
+    await checkAdmin();
+
+    // Validate status
+    const validStatuses: OrderStatus[] = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'];
+    
+    if (!validStatuses.includes(status as OrderStatus)) {
+      throw new Error('Invalid status');
+    }
+
+    const existingOrder = await prisma.order.findUnique({
+      where: { id: orderId },
+    });
+
+    if (!existingOrder) {
+      throw new Error('Order not found');
+    }
+
+    // Update order status
+    const updatedOrder = await prisma.order.update({
+      where: { id: orderId },
+      data: { status: status as OrderStatus },
+      include: {
+        user: true,
+        orderItems: {
+          include: {
+            product: true,
+          },
+        },
+      },
+    });
+
+    // Optional: Send email notification
+    // await sendOrderStatusEmail(updatedOrder);
+
+    // Revalidate relevant paths to update UI
+    revalidatePath(`/admin/orders/${orderId}`);
+    revalidatePath('/admin/orders');
+
+    return updatedOrder;
+  } catch (error) {
+    console.error('Error updating order status:', error);
+    throw error;
+  }
+}
+
+// Send order status email
+export async function sendOrderStatusEmail(orderId: string, emailType: string) {
+  try {
+    await checkAdmin();
+
+    const order = await prisma.order.findUnique({
+      where: {
+        id: orderId,
+      },
+      include: {
+        user: true,
+      },
+    });
+
+    if (!order) {
+      throw new Error('Order not found');
+    }
+
+    // Logic to send email would go here
+    // For now, we'll just return a success message
+
+    return {
+      success: true,
+      message: `${emailType} email would be sent to ${order.user.email}`,
+    };
+  } catch (error) {
+    console.error('Error sending email:', error);
+    throw error;
+  }
+}
+```
+
 # app\admin\email\page.tsx
 
 ```tsx
@@ -1146,15 +1346,16 @@ export default function AdminLayout({
 }
 ```
 
-# app\admin\orders\[orderId]\page.tsx
+# app\admin\orders\[orderId]\OrderDetail.tsx
 
 ```tsx
+//src/app/admin/orders/[orderId]/OrderDetail.tsx
+
 'use client';
 
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
-import { useParams } from 'next/navigation';
 import { 
   ArrowLeft, 
   Package, 
@@ -1165,83 +1366,56 @@ import {
   Clock,
   RefreshCw
 } from 'lucide-react';
+import { getOrderDetails, updateOrderStatus, sendOrderStatusEmail } from '@/app/actions/admin/orders';
+import { AdminOrder, ShippingDetails } from '@/types/order';
+import { OrderStatus } from '@prisma/client';
 
-interface OrderItem {
-  id: string;
-  quantity: number;
-  price: number;
-  product: {
-    id: string;
-    name: string;
-    images: string;
-  };
+interface OrderDetailClientProps {
+  orderId: string;
 }
 
-interface Order {
-  id: string;
-  createdAt: string;
-  status: string;
-  totalAmount: number;
-  paymentId: string;
-  shippingAddress: string;
-  user: {
-    id: string;
-    name: string;
-    email: string;
-  };
-  orderItems: OrderItem[];
-}
-
-export default function AdminOrderDetail() {
-  const params = useParams();
-  const orderId = params.orderId as string;
-  
-  const [order, setOrder] = useState<Order | null>(null);
+export default function OrderDetailClient({ orderId }: OrderDetailClientProps) {
+  const [order, setOrder] = useState<AdminOrder | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [updatingStatus, setUpdatingStatus] = useState(false);
 
-  const fetchOrderDetails = useCallback(async () => {
-    try {
-      setLoading(true);
-      const response = await fetch(`/api/admin/orders/${orderId}`);
-      if (!response.ok) {
-        throw new Error('Failed to fetch order details');
+  useEffect(() => {
+    async function fetchOrder() {
+      try {
+        setLoading(true);
+        const orderData = await getOrderDetails(orderId);
+        // Type cast the response to AdminOrder to ensure type compatibility
+        setOrder(orderData as unknown as AdminOrder);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'An error occurred');
+      } finally {
+        setLoading(false);
       }
-      const data = await response.json();
-      setOrder(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'An error occurred');
-    } finally {
-      setLoading(false);
     }
+    
+    fetchOrder();
   }, [orderId]);
 
-  useEffect(() => {
-    fetchOrderDetails();
-  }, [fetchOrderDetails]);
-
-  const updateOrderStatus = async (newStatus: string) => {
+  const handleUpdateStatus = async (newStatus: OrderStatus) => {
     try {
       setUpdatingStatus(true);
-      const response = await fetch(`/api/admin/orders/${orderId}`, {
-        method: 'PATCH',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ status: newStatus }),
-      });
-
-      if (!response.ok) {
-        throw new Error('Failed to update order status');
-      }
-
-      const updatedOrder = await response.json();
-      setOrder(updatedOrder);
+      const updatedOrder = await updateOrderStatus(orderId, newStatus);
+      // Type cast the response to AdminOrder to ensure type compatibility
+      setOrder(updatedOrder as unknown as AdminOrder);
     } catch (err) {
       setError(err instanceof Error ? err.message : 'An error occurred');
     } finally {
       setUpdatingStatus(false);
+    }
+  };
+  
+  const handleSendEmail = async (emailType: string) => {
+    try {
+      await sendOrderStatusEmail(orderId, emailType);
+      alert(`${emailType} email has been sent!`);
+    } catch (err) {
+      alert(`Error sending email: ${err instanceof Error ? err.message : 'An error occurred'}`);
     }
   };
 
@@ -1288,7 +1462,7 @@ export default function AdminOrderDetail() {
       <div className="flex flex-wrap gap-2">
         {currentStatus === 'pending' && (
           <button
-            onClick={() => updateOrderStatus('PROCESSING')}
+            onClick={() => handleUpdateStatus('PROCESSING')}
             disabled={updatingStatus}
             className="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md shadow-sm text-white bg-blue-600 hover:bg-blue-700 focus:outline-none disabled:opacity-50"
           >
@@ -1299,7 +1473,7 @@ export default function AdminOrderDetail() {
         
         {currentStatus === 'processing' && (
           <button
-            onClick={() => updateOrderStatus('SHIPPED')}
+            onClick={() => handleUpdateStatus('SHIPPED')}
             disabled={updatingStatus}
             className="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md shadow-sm text-white bg-purple-600 hover:bg-purple-700 focus:outline-none disabled:opacity-50"
           >
@@ -1310,7 +1484,7 @@ export default function AdminOrderDetail() {
         
         {currentStatus === 'shipped' && (
           <button
-            onClick={() => updateOrderStatus('DELIVERED')}
+            onClick={() => handleUpdateStatus('DELIVERED')}
             disabled={updatingStatus}
             className="inline-flex items-center px-3 py-2 border border-transparent text-sm leading-4 font-medium rounded-md shadow-sm text-white bg-green-600 hover:bg-green-700 focus:outline-none disabled:opacity-50"
           >
@@ -1321,7 +1495,7 @@ export default function AdminOrderDetail() {
         
         {!['cancelled', 'delivered'].includes(currentStatus) && (
           <button
-            onClick={() => updateOrderStatus('CANCELLED')}
+            onClick={() => handleUpdateStatus('CANCELLED')}
             disabled={updatingStatus}
             className="inline-flex items-center px-3 py-2 border border-gray-300 text-sm leading-4 font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none disabled:opacity-50"
           >
@@ -1331,7 +1505,7 @@ export default function AdminOrderDetail() {
         )}
         
         <button
-          onClick={() => window.open(`/api/admin/orders/${orderId}/email`, '_blank')}
+          onClick={() => handleSendEmail('Status Update')}
           className="inline-flex items-center px-3 py-2 border border-gray-300 text-sm leading-4 font-medium rounded-md shadow-sm text-gray-700 bg-white hover:bg-gray-50 focus:outline-none"
         >
           <Send className="w-4 h-4 mr-2" />
@@ -1372,8 +1546,10 @@ export default function AdminOrderDetail() {
     );
   }
 
-  // Parse shipping address from JSON string
-  const shippingAddress = JSON.parse(typeof order.shippingAddress === 'string' ? order.shippingAddress : '{}');
+  // Parse shipping address from JSON string if needed
+  const shippingAddress = typeof order.shippingAddress === 'string' 
+    ? JSON.parse(order.shippingAddress) as ShippingDetails
+    : order.shippingAddress as ShippingDetails;
 
   return (
     <div className="p-6">
@@ -1416,8 +1592,13 @@ export default function AdminOrderDetail() {
             </div>
             <div className="divide-y divide-gray-200">
               {order.orderItems.map((item) => {
-                const images = JSON.parse(item.product.images as string);
-                const imageUrl = images[0] || '/api/placeholder/80/80';
+                const images = typeof item.product.images === 'string' 
+                  ? JSON.parse(item.product.images) 
+                  : item.product.images;
+                
+                const imageUrl = Array.isArray(images) && images.length > 0 
+                  ? images[0] 
+                  : '/api/placeholder/80/80';
                 
                 return (
                   <div key={item.id} className="p-6 flex items-center">
@@ -1495,11 +1676,11 @@ export default function AdminOrderDetail() {
             <div className="p-6">
               <div className="space-y-4">
                 <div>
-                  <h3 className="text-sm font-medium text-gray-900">{order.user.name}</h3>
-                  <p className="text-sm text-gray-500">{order.user.email}</p>
+                  <h3 className="text-sm font-medium text-gray-900">{order.user?.name || 'Customer'}</h3>
+                  <p className="text-sm text-gray-500">{order.user?.email}</p>
                 </div>
                 <Link
-                  href={`/admin/users/${order.user.id}`}
+                  href={`/admin/users/${order.user?.id}`}
                   className="text-sm text-blue-600 hover:text-blue-500"
                 >
                   View Customer
@@ -1515,10 +1696,15 @@ export default function AdminOrderDetail() {
             </div>
             <div className="p-6">
               <div className="space-y-1">
-                <p className="text-sm text-gray-900">{shippingAddress.name || order.user.name}</p>
-                <p className="text-sm text-gray-500">{shippingAddress.street}</p>
+                <p className="text-sm text-gray-900">
+                  {`${shippingAddress.firstName} ${shippingAddress.lastName}` || order.user?.name || 'Customer'}
+                </p>
+                <p className="text-sm text-gray-500">{shippingAddress.address}</p>
+                {shippingAddress.apartment && (
+                  <p className="text-sm text-gray-500">{shippingAddress.apartment}</p>
+                )}
                 <p className="text-sm text-gray-500">
-                  {shippingAddress.city}, {shippingAddress.postcode}
+                  {shippingAddress.city}, {shippingAddress.postalCode}
                 </p>
                 <p className="text-sm text-gray-500">{shippingAddress.country}</p>
               </div>
@@ -1558,55 +1744,87 @@ export default function AdminOrderDetail() {
 }
 ```
 
-# app\admin\orders\page.tsx
+# app\admin\orders\[orderId]\page.tsx
 
 ```tsx
-//app/admin/orders/page.tsx
+//src/app/admin/orders/[orderId]/page.tsx
+
+import { Suspense } from 'react';
+import OrderDetailClient from './OrderDetail';
+
+export default function OrderDetailPage({
+  params,
+}: {
+  params: { orderId: string };
+}) {
+  return (
+    <Suspense fallback={<div>Loading...</div>}>
+      <OrderDetailClient orderId={params.orderId} />
+    </Suspense>
+  );
+}
+```
+
+# app\admin\orders\OrdersList.tsx
+
+```tsx
+//src/app/admin/orders/OrdersList.tsx
+
 
 'use client';
 
 import React, { useState, useEffect } from 'react';
 import Link from 'next/link';
-import { Package, Search, Filter, ChevronDown, MoreHorizontal } from 'lucide-react';
+import { Package, Search, ChevronDown, MoreHorizontal } from 'lucide-react';
+import { getAllOrders } from '@/app/actions/admin/orders';
+import { Decimal } from '@prisma/client/runtime/library';
 
+// Update the Order interface to handle Decimal
 interface Order {
   id: string;
-  createdAt: string;
+  createdAt: string | Date;
   status: string;
-  totalAmount: number;
+  totalAmount: number | Decimal; // Allow both number and Decimal
   user: {
-    name: string;
+    name: string | null;
     email: string;
+    id: string; // Add id as it's coming from the API
   };
   orderItems: Array<{
+    id: string;
     quantity: number;
+    price: number | Decimal;
     product: {
+      id: string;
       name: string;
     };
   }>;
 }
 
-export default function AdminOrders() {
+export default function OrdersClient() {
   const [orders, setOrders] = useState<Order[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
-  const [statusFilter] = useState('all');
+  const [statusFilter, setStatusFilter] = useState('all');
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
+    async function fetchOrders() {
+      try {
+        setIsLoading(true);
+        const ordersData = await getAllOrders();
+        // Type cast to ensure compatibility
+        setOrders(ordersData as unknown as Order[]);
+      } catch (err) {
+        setError(err instanceof Error ? err.message : 'Failed to fetch orders');
+        console.error('Error fetching orders:', err);
+      } finally {
+        setIsLoading(false);
+      }
+    }
+
     fetchOrders();
   }, []);
-
-  const fetchOrders = async () => {
-    try {
-      const response = await fetch('/api/admin/orders');
-      const data = await response.json();
-      setOrders(data);
-    } catch (error) {
-      console.error('Error fetching orders:', error);
-    } finally {
-      setIsLoading(false);
-    }
-  };
 
   const getStatusColor = (status: string) => {
     switch (status.toLowerCase()) {
@@ -1626,11 +1844,13 @@ export default function AdminOrders() {
   };
 
   const filteredOrders = orders.filter(order => {
+    // Search filter
     const matchesSearch = 
       order.id.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      order.user.name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-      order.user.email.toLowerCase().includes(searchTerm.toLowerCase());
+      (order.user?.name?.toLowerCase() || '').includes(searchTerm.toLowerCase()) ||
+      (order.user?.email?.toLowerCase() || '').includes(searchTerm.toLowerCase());
 
+    // Status filter
     const matchesStatus = 
       statusFilter === 'all' || 
       order.status.toLowerCase() === statusFilter.toLowerCase();
@@ -1664,14 +1884,19 @@ export default function AdminOrders() {
           </div>
           <div className="flex gap-4">
             <div className="relative">
-              <button
-                className="px-4 py-2 bg-white border border-gray-300 rounded-md inline-flex items-center text-sm font-medium text-gray-700 hover:bg-gray-50"
+              <select
+                value={statusFilter}
+                onChange={(e) => setStatusFilter(e.target.value)}
+                className="px-4 py-2 bg-white border border-gray-300 rounded-md text-sm font-medium text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500 appearance-none pr-8"
               >
-                <Filter className="w-4 h-4 mr-2" />
-                Status
-                <ChevronDown className="w-4 h-4 ml-2" />
-              </button>
-              {/* Status filter dropdown would go here */}
+                <option value="all">All Statuses</option>
+                <option value="pending">Pending</option>
+                <option value="processing">Processing</option>
+                <option value="shipped">Shipped</option>
+                <option value="delivered">Delivered</option>
+                <option value="cancelled">Cancelled</option>
+              </select>
+              <ChevronDown className="absolute right-3 top-1/2 transform -translate-y-1/2 text-gray-400 pointer-events-none w-4 h-4" />
             </div>
           </div>
         </div>
@@ -1683,6 +1908,12 @@ export default function AdminOrders() {
           <Package className="w-12 h-12 text-gray-400 mx-auto mb-4" />
           <h3 className="text-lg font-medium text-gray-900 mb-2">Loading Orders</h3>
           <p className="text-gray-500">Please wait while we fetch the orders...</p>
+        </div>
+      ) : error ? (
+        <div className="text-center py-12 bg-white rounded-lg border border-gray-200">
+          <Package className="w-12 h-12 text-red-400 mx-auto mb-4" />
+          <h3 className="text-lg font-medium text-gray-900 mb-2">Error Loading Orders</h3>
+          <p className="text-gray-500 mb-4">{error}</p>
         </div>
       ) : filteredOrders.length === 0 ? (
         <div className="text-center py-12 bg-white rounded-lg border border-gray-200">
@@ -1732,8 +1963,8 @@ export default function AdminOrders() {
                       </Link>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap">
-                      <div className="text-sm font-medium text-gray-900">{order.user.name}</div>
-                      <div className="text-sm text-gray-500">{order.user.email}</div>
+                      <div className="text-sm font-medium text-gray-900">{order.user?.name || 'Unknown'}</div>
+                      <div className="text-sm text-gray-500">{order.user?.email || 'No email'}</div>
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                       {new Date(order.createdAt).toLocaleDateString()}
@@ -1750,9 +1981,17 @@ export default function AdminOrders() {
                       {order.orderItems.reduce((acc, item) => acc + item.quantity, 0)} items
                     </td>
                     <td className="px-6 py-4 whitespace-nowrap text-right text-sm font-medium">
-                      <button className="text-gray-400 hover:text-gray-500">
-                        <MoreHorizontal className="w-5 h-5" />
-                      </button>
+                      <div className="flex items-center justify-end space-x-2">
+                        <Link 
+                          href={`/admin/orders/${order.id}`}
+                          className="text-indigo-600 hover:text-indigo-900"
+                        >
+                          View
+                        </Link>
+                        <button className="text-gray-400 hover:text-gray-500">
+                          <MoreHorizontal className="w-5 h-5" />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 ))}
@@ -1762,6 +2001,23 @@ export default function AdminOrders() {
         </div>
       )}
     </div>
+  );
+}
+```
+
+# app\admin\orders\page.tsx
+
+```tsx
+//app/admin/orders/page.tsx
+
+import { Suspense } from 'react';
+import OrdersClient from './OrdersList';
+
+export default function OrdersPage() {
+  return (
+    <Suspense fallback={<div>Loading orders...</div>}>
+      <OrdersClient />
+    </Suspense>
   );
 }
 ```
@@ -2145,190 +2401,190 @@ export default function AdminLayout({
 ```ts
 // app/api/admin/orders/[orderId]/route.ts
 
-import { NextRequest, NextResponse } from 'next/server';
-import { getServerSession } from 'next-auth';
-import { authOptions } from '@/app/api/auth/[...nextauth]/route';
-import { prisma } from '@/lib/prisma';
-import { OrderStatus } from '@prisma/client';
+// import { NextRequest, NextResponse } from 'next/server';
+// import { getServerSession } from 'next-auth';
+// import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+// import { prisma } from '@/lib/prisma';
+// import { OrderStatus } from '@prisma/client';
 
-// Simple OrderService implementation
-class OrderService {
-  async updateOrderStatus(orderId: string, status: OrderStatus) {
-    return prisma.order.update({
-      where: { id: orderId },
-      data: { status }, // TypeScript now knows status is an OrderStatus value
-      include: {
-        user: true,
-        orderItems: {
-          include: {
-            product: true
-          }
-        }
-      }
-    });
-  }
-}
+// // Simple OrderService implementation
+// class OrderService {
+//   async updateOrderStatus(orderId: string, status: OrderStatus) {
+//     return prisma.order.update({
+//       where: { id: orderId },
+//       data: { status },
+//       include: {
+//         user: true,
+//         orderItems: {
+//           include: {
+//             product: true
+//           }
+//         }
+//       }
+//     });
+//   }
+// }
 
-const orderService = new OrderService();
+// const orderService = new OrderService();
 
-// Use the exact type signature expected by Next.js
-export async function GET(
-  req: NextRequest, 
-  context: { params: { orderId: string } }
-) {
-  try {
-    const session = await getServerSession(authOptions);
+// // Fix the type definition for the GET handler
+// export async function GET(
+//   request: NextRequest,
+//   { params }: { params: { orderId: string } }
+// ) {
+//   try {
+//     const session = await getServerSession(authOptions);
 
-    if (session?.user?.role !== 'ADMIN') {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
-    }
+//     if (session?.user?.role !== 'ADMIN') {
+//       return NextResponse.json(
+//         { error: 'Unauthorized' },
+//         { status: 401 }
+//       );
+//     }
 
-    const orderId = context.params.orderId;
+//     const orderId = params.orderId;
 
-    const order = await prisma.order.findUnique({
-      where: {
-        id: orderId,
-      },
-      include: {
-        user: {
-          select: {
-            id: true,
-            name: true,
-            email: true,
-          },
-        },
-        orderItems: {
-          include: {
-            product: true,
-          },
-        },
-      },
-    });
+//     const order = await prisma.order.findUnique({
+//       where: {
+//         id: orderId,
+//       },
+//       include: {
+//         user: {
+//           select: {
+//             id: true,
+//             name: true,
+//             email: true,
+//           },
+//         },
+//         orderItems: {
+//           include: {
+//             product: true,
+//           },
+//         },
+//       },
+//     });
 
-    if (!order) {
-      return NextResponse.json(
-        { error: 'Order not found' },
-        { status: 404 }
-      );
-    }
+//     if (!order) {
+//       return NextResponse.json(
+//         { error: 'Order not found' },
+//         { status: 404 }
+//       );
+//     }
 
-    return NextResponse.json(order);
-  } catch (error) {
-    console.error('Error fetching order:', error);
-    return NextResponse.json(
-      { error: 'Error fetching order' },
-      { status: 500 }
-    );
-  }
-}
+//     return NextResponse.json(order);
+//   } catch (error) {
+//     console.error('Error fetching order:', error);
+//     return NextResponse.json(
+//       { error: 'Error fetching order' },
+//       { status: 500 }
+//     );
+//   }
+// }
 
-// Same change for PATCH
-export async function PATCH(
-  req: NextRequest, 
-  context: { params: { orderId: string } }
-) {
-  try {
-    const session = await getServerSession(authOptions);
+// // Fix the PATCH handler with the same parameter pattern
+// export async function PATCH(
+//   request: NextRequest,
+//   { params }: { params: { orderId: string } }
+// ) {
+//   try {
+//     const session = await getServerSession(authOptions);
 
-    if (session?.user?.role !== 'ADMIN') {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
-    }
+//     if (session?.user?.role !== 'ADMIN') {
+//       return NextResponse.json(
+//         { error: 'Unauthorized' },
+//         { status: 401 }
+//       );
+//     }
 
-    const orderId = context.params.orderId;
-    const { status } = await req.json();
+//     const orderId = params.orderId;
+//     const { status } = await request.json();
 
-    // Define valid statuses as an array of OrderStatus values
-    const validStatuses: OrderStatus[] = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'];
+//     // Define valid statuses as an array of OrderStatus values
+//     const validStatuses: OrderStatus[] = ['PENDING', 'PROCESSING', 'SHIPPED', 'DELIVERED', 'CANCELLED'];
     
-    // Type guard to ensure status is an OrderStatus
-    if (!validStatuses.includes(status as OrderStatus)) {
-      return NextResponse.json(
-        { error: 'Invalid status' },
-        { status: 400 }
-      );
-    }
+//     // Type guard to ensure status is an OrderStatus
+//     if (!validStatuses.includes(status as OrderStatus)) {
+//       return NextResponse.json(
+//         { error: 'Invalid status' },
+//         { status: 400 }
+//       );
+//     }
 
-    const existingOrder = await prisma.order.findUnique({
-      where: { id: orderId },
-    });
+//     const existingOrder = await prisma.order.findUnique({
+//       where: { id: orderId },
+//     });
 
-    if (!existingOrder) {
-      return NextResponse.json(
-        { error: 'Order not found' },
-        { status: 404 }
-      );
-    }
+//     if (!existingOrder) {
+//       return NextResponse.json(
+//         { error: 'Order not found' },
+//         { status: 404 }
+//       );
+//     }
 
-    // Cast status to OrderStatus since we validated it
-    const updatedOrder = await orderService.updateOrderStatus(orderId, status as OrderStatus);
+//     // Cast status to OrderStatus since we validated it
+//     const updatedOrder = await orderService.updateOrderStatus(orderId, status as OrderStatus);
 
-    return NextResponse.json(updatedOrder);
-  } catch (error) {
-    console.error('Error updating order:', error);
-    return NextResponse.json(
-      { error: 'Error updating order' },
-      { status: 500 }
-    );
-  }
-}
+//     return NextResponse.json(updatedOrder);
+//   } catch (error) {
+//     console.error('Error updating order:', error);
+//     return NextResponse.json(
+//       { error: 'Error updating order' },
+//       { status: 500 }
+//     );
+//   }
+// }
 
-// Same change for POST
-export async function POST(
-  req: NextRequest, 
-  context: { params: { orderId: string } }
-) {
-  try {
-    const session = await getServerSession(authOptions);
+// // Fix the POST handler with the same parameter pattern
+// export async function POST(
+//   request: NextRequest,
+//   { params }: { params: { orderId: string } }
+// ) {
+//   try {
+//     const session = await getServerSession(authOptions);
 
-    if (session?.user?.role !== 'ADMIN') {
-      return NextResponse.json(
-        { error: 'Unauthorized' },
-        { status: 401 }
-      );
-    }
+//     if (session?.user?.role !== 'ADMIN') {
+//       return NextResponse.json(
+//         { error: 'Unauthorized' },
+//         { status: 401 }
+//       );
+//     }
 
-    const orderId = context.params.orderId;
-    const { emailType } = await req.json();
+//     const orderId = params.orderId;
+//     const { emailType } = await request.json();
 
-    const order = await prisma.order.findUnique({
-      where: {
-        id: orderId,
-      },
-      include: {
-        user: true,
-        orderItems: {
-          include: {
-            product: true,
-          },
-        },
-      },
-    });
+//     const order = await prisma.order.findUnique({
+//       where: {
+//         id: orderId,
+//       },
+//       include: {
+//         user: true,
+//         orderItems: {
+//           include: {
+//             product: true,
+//           },
+//         },
+//       },
+//     });
 
-    if (!order) {
-      return NextResponse.json(
-        { error: 'Order not found' },
-        { status: 404 }
-      );
-    }
+//     if (!order) {
+//       return NextResponse.json(
+//         { error: 'Order not found' },
+//         { status: 404 }
+//       );
+//     }
 
-    return NextResponse.json({
-      success: true,
-      message: `${emailType} email sent to ${order.user.email}`,
-    });
-  } catch (error) {
-    console.error('Error sending email:', error);
-    return NextResponse.json(
-      { error: 'Error sending email' },
-      { status: 500 }
-    );
-  }
-}
+//     return NextResponse.json({
+//       success: true,
+//       message: `${emailType} email sent to ${order.user.email}`,
+//     });
+//   } catch (error) {
+//     console.error('Error sending email:', error);
+//     return NextResponse.json(
+//       { error: 'Error sending email' },
+//       { status: 500 }
+//     );
+//   }
+// }
 ```
 
 # app\api\admin\orders\route.ts
@@ -2812,8 +3068,10 @@ export { handler as GET, handler as POST };
 import { useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { AlertCircle } from 'lucide-react';
+import { Suspense } from 'react';
 
-export default function AuthErrorPage() {
+// Create a component that uses the useSearchParams hook
+function ErrorContent() {
   const searchParams = useSearchParams();
   const error = searchParams.get('error');
 
@@ -2829,31 +3087,45 @@ export default function AuthErrorPage() {
   const errorMessage = error ? (errorMessages[error] || errorMessages.default) : errorMessages.default;
 
   return (
-    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
-      <div className="max-w-md w-full text-center">
-        <AlertCircle className="mx-auto h-16 w-16 text-red-500" />
-        <h2 className="mt-6 text-3xl font-light text-gray-900">Authentication Error</h2>
-        
-        <div className="mt-8 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
-          {errorMessage}
-        </div>
-
-        <div className="mt-8 space-y-4">
-          <Link 
-            href="/auth/login" 
-            className="inline-block w-full px-4 py-3 bg-black text-white rounded-md hover:bg-gray-800"
-          >
-            Return to login
-          </Link>
-          
-          <Link
-            href="/"
-            className="inline-block text-sm text-gray-600 hover:text-gray-900"
-          >
-            Return to home page
-          </Link>
-        </div>
+    <div className="max-w-md w-full text-center">
+      <AlertCircle className="mx-auto h-16 w-16 text-red-500" />
+      <h2 className="mt-6 text-3xl font-light text-gray-900">Authentication Error</h2>
+      
+      <div className="mt-8 bg-red-50 border border-red-200 text-red-700 px-4 py-3 rounded">
+        {errorMessage}
       </div>
+
+      <div className="mt-8 space-y-4">
+        <Link 
+          href="/auth/login" 
+          className="inline-block w-full px-4 py-3 bg-black text-white rounded-md hover:bg-gray-800"
+        >
+          Return to login
+        </Link>
+        
+        <Link
+          href="/"
+          className="inline-block text-sm text-gray-600 hover:text-gray-900"
+        >
+          Return to home page
+        </Link>
+      </div>
+    </div>
+  );
+}
+
+// Main component that wraps the content in a Suspense boundary
+export default function AuthErrorPage() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+      <Suspense fallback={
+        <div className="max-w-md w-full text-center">
+          <AlertCircle className="mx-auto h-16 w-16 text-gray-300" />
+          <h2 className="mt-6 text-3xl font-light text-gray-900">Loading...</h2>
+        </div>
+      }>
+        <ErrorContent />
+      </Suspense>
     </div>
   );
 }
@@ -3710,8 +3982,28 @@ import { signIn } from 'next-auth/react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import Link from 'next/link';
 import { Eye, EyeOff, Lock, Mail } from 'lucide-react';
+import { Suspense } from 'react';
 
-export default function LoginPage() {
+// Loading fallback component
+function LoginPageLoading() {
+  return (
+    <div className="min-h-screen flex items-center justify-center bg-gray-50 py-12 px-4 sm:px-6 lg:px-8">
+      <div className="max-w-md w-full space-y-8 text-center">
+        <div>
+          <h2 className="mt-6 text-center text-3xl font-light text-gray-900">
+            Welcome back
+          </h2>
+          <p className="mt-2 text-center text-sm text-gray-600">
+            Loading...
+          </p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Component that uses useSearchParams
+function LoginForm() {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -3904,6 +4196,15 @@ export default function LoginPage() {
         </form>
       </div>
     </div>
+  );
+}
+
+// Main export component with Suspense
+export default function LoginPage() {
+  return (
+    <Suspense fallback={<LoginPageLoading />}>
+      <LoginForm />
+    </Suspense>
   );
 }
 ```
@@ -4475,14 +4776,33 @@ export default function CheckoutPage() {
 // src/app/checkout/success/page.tsx
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
-import { useStripe } from '@stripe/react-stripe-js';
+import { Elements, useStripe } from '@stripe/react-stripe-js';
+import { loadStripe } from '@stripe/stripe-js';
 import Link from 'next/link';
 import { CheckCircle, Truck, Mail, ArrowRight } from 'lucide-react';
 import { useCart } from '@/contexts/CartContext';
 
-export default function OrderConfirmationPage() {
+// Load Stripe outside of component render to avoid recreating Stripe object on each render
+// Replace with your actual publishable key
+const stripePromise = loadStripe(process.env.NEXT_PUBLIC_STRIPE_PUBLISHABLE_KEY || '');
+
+// Loading component
+function OrderConfirmationLoading() {
+  return (
+    <div className="min-h-screen bg-gray-50 pt-20">
+      <div className="max-w-3xl mx-auto px-4 py-16 text-center">
+        <div className="bg-white rounded-lg shadow p-8">
+          <p className="text-gray-600">Loading order confirmation...</p>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// Component that uses the Stripe hook
+function OrderConfirmationContent() {
   const stripe = useStripe();
   const searchParams = useSearchParams();
   const { clearCart } = useCart();
@@ -4612,6 +4932,32 @@ export default function OrderConfirmationPage() {
         </div>
       </div>
     </div>
+  );
+}
+
+// The actual page component
+function OrderConfirmationWithElements() {
+  const searchParams = useSearchParams();
+  const paymentIntentClientSecret = searchParams.get('payment_intent_client_secret');
+
+  // Only initialize Stripe with client secret if it exists
+  const options = paymentIntentClientSecret ? {
+    clientSecret: paymentIntentClientSecret
+  } : {};
+
+  return (
+    <Elements stripe={stripePromise} options={options}>
+      <OrderConfirmationContent />
+    </Elements>
+  );
+}
+
+// Main export component with Suspense for useSearchParams
+export default function OrderConfirmationPage() {
+  return (
+    <Suspense fallback={<OrderConfirmationLoading />}>
+      <OrderConfirmationWithElements />
+    </Suspense>
   );
 }
 ```
@@ -6332,7 +6678,7 @@ export default function ReturnsPolicy() {
 
 'use client';
 
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, Suspense } from 'react';
 import { useSearchParams } from 'next/navigation';
 import PageLayout from '@/components/layout/PageLayout';
 import ProductGrid, { BaseProduct } from '@/components/products/ProductGrid';
@@ -6351,7 +6697,8 @@ interface SearchResult extends BaseProduct {
   isCrueltyFree: boolean;
 }
 
-export default function SearchPage() {
+// Create a separate component that uses useSearchParams
+function SearchContent() {
   const searchParams = useSearchParams();
   const query = searchParams.get('q') || '';
   
@@ -6404,58 +6751,79 @@ export default function SearchPage() {
   });
 
   return (
-    <PageLayout>
-      <div className="bg-white py-16">
-        <div className="container mx-auto px-4">
-          {/* Search Header */}
-          <div className="mb-8">
-            <h1 className="text-3xl font-light mb-2">
-              {query ? `Search Results for "${query}"` : 'Search Products'}
-            </h1>
-            <p className="text-gray-600">
-              {filteredResults.length} products found
+    <div className="bg-white py-16">
+      <div className="container mx-auto px-4">
+        {/* Search Header */}
+        <div className="mb-8">
+          <h1 className="text-3xl font-light mb-2">
+            {query ? `Search Results for "${query}"` : 'Search Products'}
+          </h1>
+          <p className="text-gray-600">
+            {filteredResults.length} products found
+          </p>
+        </div>
+
+        {isLoading ? (
+          <div className="flex items-center justify-center py-20">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-black"></div>
+          </div>
+        ) : error ? (
+          <div className="text-center py-20">
+            <Search className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+            <h2 className="text-xl font-medium text-gray-900 mb-2">Search Error</h2>
+            <p className="text-gray-500">{error}</p>
+          </div>
+        ) : results.length === 0 ? (
+          <div className="text-center py-20">
+            <Search className="w-12 h-12 text-gray-400 mx-auto mb-4" />
+            <h2 className="text-xl font-medium text-gray-900 mb-2">No Results Found</h2>
+            <p className="text-gray-500">
+              We couldn&apos;t find any products matching your search.
+              Try checking your spelling or using different keywords.
             </p>
           </div>
+        ) : (
+          <div className="flex flex-col md:flex-row gap-8">
+            {/* Filters */}
+            <div className="w-full md:w-64">
+              <ProductFilters
+                brands={brands}
+                categories={categories}
+                activeFilters={activeFilters}
+                onFilterChange={setActiveFilters}
+              />
+            </div>
 
-          {isLoading ? (
-            <div className="flex items-center justify-center py-20">
-              <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-black"></div>
+            {/* Results Grid */}
+            <div className="flex-1">
+              <ProductGrid products={filteredResults} />
             </div>
-          ) : error ? (
-            <div className="text-center py-20">
-              <Search className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-              <h2 className="text-xl font-medium text-gray-900 mb-2">Search Error</h2>
-              <p className="text-gray-500">{error}</p>
-            </div>
-          ) : results.length === 0 ? (
-            <div className="text-center py-20">
-              <Search className="w-12 h-12 text-gray-400 mx-auto mb-4" />
-              <h2 className="text-xl font-medium text-gray-900 mb-2">No Results Found</h2>
-              <p className="text-gray-500">
-                We couldn&apos;t find any products matching your search.
-                Try checking your spelling or using different keywords.
-              </p>
-            </div>
-          ) : (
-            <div className="flex flex-col md:flex-row gap-8">
-              {/* Filters */}
-              <div className="w-full md:w-64">
-                <ProductFilters
-                  brands={brands}
-                  categories={categories}
-                  activeFilters={activeFilters}
-                  onFilterChange={setActiveFilters}
-                />
-              </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-              {/* Results Grid */}
-              <div className="flex-1">
-                <ProductGrid products={filteredResults} />
-              </div>
-            </div>
-          )}
+// Loading fallback component
+function SearchLoading() {
+  return (
+    <div className="bg-white py-16">
+      <div className="container mx-auto px-4">
+        <div className="flex items-center justify-center py-20">
+          <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-black"></div>
         </div>
       </div>
+    </div>
+  );
+}
+
+export default function SearchPage() {
+  return (
+    <PageLayout>
+      <Suspense fallback={<SearchLoading />}>
+        <SearchContent />
+      </Suspense>
     </PageLayout>
   );
 }
@@ -12547,25 +12915,24 @@ interface OrderStatusData {
 
 ```ts
 // src/lib/prisma.ts
-import { PrismaClient, Decimal } from '@prisma/client';
+import { PrismaClient } from '@prisma/client'
 
-
-const prismaClientSingleton = () => {
-  return new PrismaClient();
-};
-
-type PrismaClientSingleton = ReturnType<typeof prismaClientSingleton>;
-
+// This approach prevents multiple instances of Prisma Client in development
 const globalForPrisma = globalThis as unknown as {
-  prisma: PrismaClientSingleton | undefined;
-};
+  prisma: PrismaClient | undefined
+}
 
-export const prisma = globalForPrisma.prisma ?? prismaClientSingleton();
+export const prisma = globalForPrisma.prisma ?? new PrismaClient()
 
-if (process.env.NODE_ENV !== 'production') globalForPrisma.prisma = prisma;
+if (process.env.NODE_ENV !== 'production') {
+  globalForPrisma.prisma = prisma
+}
 
-// Export Decimal explicitly
-export { Decimal };
+// For handling decimal values in your application
+export type Decimal = {
+  toFixed: (precision: number) => string
+  toString: () => string
+}
 ```
 
 # lib\services\orderService.ts
@@ -12894,7 +13261,15 @@ declare module 'next-auth' {
 
 ```ts
 // src/types/order.ts
-import { Product } from '@prisma/client';
+import { OrderStatus } from '@prisma/client';
+import { Decimal } from '@prisma/client/runtime/library';
+
+// Define a simpler User type that matches what we get from the API
+export interface UserBasic {
+  id: string;
+  name: string | null;
+  email: string;
+}
 
 export interface ShippingDetails {
   firstName: string;
@@ -12916,20 +13291,63 @@ export interface PaymentDetails {
   cvv: string;
 }
 
-export interface OrderItem {
-  product: Product;
-  quantity: number;
+// Define our own Product interface to avoid extending Prisma's Product
+export interface ProductWithImages {
+  id: string;
+  name: string;
+  brand: string;
+  description: string;
+  price: Decimal | number;
+  images: string | string[]; // Handle both string and parsed array
+  category: string;
+  isVegan: boolean;
+  isCrueltyFree: boolean;
+  stock: number;
+  createdAt?: Date | string;
+  updatedAt?: Date | string;
 }
 
+export interface OrderItem {
+  id: string;
+  product: ProductWithImages;
+  quantity: number;
+  price: number | Decimal;
+}
+
+// Basic order interface (matches your current structure)
 export interface Order {
   id: string;
   userId: string;
   items: OrderItem[];
-  totalAmount: number;
+  totalAmount: number | Decimal;
   shippingAddress: string;
-  status: 'PENDING' | 'PROCESSING' | 'SHIPPED' | 'DELIVERED' | 'CANCELLED';
-  createdAt: Date;
-  updatedAt: Date;
+  status: OrderStatus;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+}
+
+// Extended order interface for the admin panel with additional details
+export interface AdminOrder {
+  id: string;
+  user: UserBasic; // Use the simpler user type
+  status: OrderStatus;
+  totalAmount: number | Decimal;
+  shippingAddress: string | ShippingDetails;
+  paymentId: string;
+  createdAt: Date | string;
+  updatedAt: Date | string;
+  orderItems: OrderItem[];
+  tracking?: {
+    number: string;
+    carrier: string;
+    status: string;
+    estimatedDelivery: string;
+    events: Array<{
+      date: string;
+      location: string;
+      status: string;
+    }>;
+  };
 }
 ```
 
