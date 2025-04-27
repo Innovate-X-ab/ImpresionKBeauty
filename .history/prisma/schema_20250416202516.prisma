@@ -1,0 +1,143 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id            String    @id @default(cuid())
+  email         String    @unique
+  password      String
+  name          String?
+  role          Role      @default(USER)
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  wishlists     Wishlist[]
+  reviews       Review[]
+  orders        Order[]
+}
+
+model Product {
+  id            String    @id @default(cuid())
+  name          String
+  brand         String
+  description   String    @db.Text
+  price         Decimal   @db.Decimal(10, 2)
+  images        String    @db.Text  // Stored as JSON string of URLs
+  category      String
+  isVegan       Boolean   @default(false)
+  isCrueltyFree Boolean   @default(false)
+  stock         Int
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+  wishlists     Wishlist[]
+  reviews       Review[]
+  orderItems    OrderItem[]
+}
+
+model Wishlist {
+  id        String   @id @default(cuid())
+  userId    String
+  productId String
+  createdAt DateTime @default(now())
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, productId])
+}
+
+model Review {
+  id        String   @id @default(cuid())
+  rating    Int
+  comment   String
+  createdAt DateTime @default(now())
+  updatedAt DateTime @default(now())
+  product   Product  @relation(fields: [productId], references: [id])
+  productId String
+  user      User     @relation(fields: [userId], references: [id])
+  userId    String
+}
+
+model Order {
+  id            String      @id @default(cuid())
+  userId        String
+  status        OrderStatus @default(PENDING)
+  totalAmount   Decimal     @db.Decimal(10, 2)
+  shippingAddress String    @db.Text
+  paymentId     String
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+  user          User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  orderItems    OrderItem[]
+}
+
+model OrderItem {
+  id        String   @id @default(cuid())
+  orderId   String
+  productId String
+  quantity  Int
+  price     Decimal  @db.Decimal(10, 2)
+  order     Order    @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+}
+
+model EmailLog {
+  id          String      @id @default(cuid())
+  to          String
+  subject     String
+  status      EmailStatus
+  attempts    Int         @default(0)
+  error       String?
+  createdAt   DateTime    @default(now())
+  sentAt      DateTime?
+  lastAttempt DateTime?
+
+  @@index([status])
+  @@index([createdAt])
+}
+
+enum Role {
+  USER
+  ADMIN
+}
+
+enum OrderStatus {
+  PENDING
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+}
+
+enum EmailStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+}
+
+model SocialPost {
+  id            String    @id @default(cuid())
+  platform      String    // "instagram" or "tiktok"
+  mediaUrl      String    @db.Text  // Image URL or video URL
+  thumbnailUrl  String?   @db.Text  // Thumbnail for videos, same as mediaUrl for images
+  mediaType     String    // "image" or "video"
+  caption       String    @db.Text
+  likes         Int       @default(0)
+  externalUrl   String?   @db.Text  // Original post URL
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+enum ProductCategory {
+  CLEANSER
+  TONER
+  SERUM
+  MOISTURIZER
+  MASK
+  SUNSCREEN
+}
